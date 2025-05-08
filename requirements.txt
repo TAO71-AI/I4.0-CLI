@@ -1,2 +1,2 @@
-I4_0-Client-PY
+I4_0-Client-PY>=14.0.0,<15.0.0
 colorama
