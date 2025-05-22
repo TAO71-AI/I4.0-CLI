@@ -164,12 +164,13 @@ def PrintWithMode(Mode: int, Text: str, End: str = "\n", Flush: bool = False, Su
     print(f"{smFore}{fore}{back}{Text}", end = extraConfig["normal_bg"] + extraConfig["normal_fg"] + End, flush = Flush)
 
 async def SendPromptToServer(Serv: Service, Prompt: str, Files: list[dict[str, str]], Index: int) -> None:
+    await AskConnectToServer()
     response = ServerUtilities.ExecuteService(
         Prompt,
         Files,
         Serv,
         Index,
-        False,
+        True,
         True
     )
     mode = 0
@@ -177,8 +178,12 @@ async def SendPromptToServer(Serv: Service, Prompt: str, Files: list[dict[str, s
     nextMode = None
     nextSubMode = None
     lastToken = ""
+    thinkTime = None
 
     async for token in response:
+        for error in token["errors"]:
+            PrintWithMode(3, f"Error in the server: {error}")
+
         for tFile in token["files"]:
             if (tFile["type"] == "audio"):
                 ext = "wav"
@@ -186,9 +191,13 @@ async def SendPromptToServer(Serv: Service, Prompt: str, Files: list[dict[str, s
                 ext = "png"
             elif (tFile["type"] == "video"):
                 ext = "mp4"
+            elif (tFile["type"] == "pdf"):
+                ext = "pdf"
+            elif (tFile["type"] == "docx"):
+                ext = "docx"
             else:
-                PrintWithMode(3, "Unknown received file format. Extension will be 'unknown'.")
-                ext = ".unknown"
+                PrintWithMode(3, f"Unknown received file format. Extension will be '{tFile['type']}'.")
+                ext = tFile["type"]
 
             fID = 0
             tempName = f"temp_{fID}.{ext}"
@@ -201,27 +210,37 @@ async def SendPromptToServer(Serv: Service, Prompt: str, Files: list[dict[str, s
                 f.write(base64.b64decode(tFile["data"]))
 
         if (nextMode is None):
-            if (token["response"].strip().startswith("```")):
+            if (
+                token["response"].strip().startswith("```") or
+                (token["response"].strip().startswith("``") and lastToken.endswith("`")) or
+                (token["response"].strip().startswith("`") and lastToken.strip().endswith("``"))
+            ):
                 if (mode != 0):
                     nextMode = 0
 
                 mode = 2
-            elif (token["response"].strip().startswith("``")):
-                mode = 2
-
-                if (lastToken.strip().endswith("`")):
-                    nextMode = 0
-            elif (token["response"].strip().startswith("`") and lastToken.strip().endswith("``")):
-                mode = 2
-                nextMode = 0
             elif (token["response"].strip().startswith("<think>") and mode == 0):
                 mode = 1
+
+                if (not extraConfig["show_think"]):
+                    PrintWithMode(mode, "<thinking...>", Flush = True, Submode = subMode)
+                    thinkTime = time.time()
             elif (token["response"].strip().startswith("</think>") and mode == 1):
                 mode = 1
                 nextMode = 0
+
+                if (not extraConfig["show_think"]):
+                    thinkTime = time.time() - thinkTime
+                    thinkTime = round(thinkTime, 1)
+
+                    PrintWithMode(mode, f"<thought for {thinkTime} seconds>", Flush = True, Submode = subMode)
+                    thinkTime = None
         else:
             mode = nextMode
             nextMode = None
+
+        if (mode == 1 and not extraConfig["show_think"]):
+            continue
 
         PrintWithMode(mode, token["response"], End = "", Flush = True, Submode = subMode)
         lastToken = token["response"]
@@ -230,19 +249,7 @@ async def SendPromptToServer(Serv: Service, Prompt: str, Files: list[dict[str, s
 
 async def ClearMemories() -> None:
     Clear()
-
-    if (not ServerUtilities.ServerCon.IsConnected()):
-        for idx, server in enumerate(ServerUtilities.Conf.Servers):
-            print(f"Server #{idx + 1}: {server}")
-
-        server = input(f"YOU'RE NOT CONNECTED TO ANY SERVER. PLEASE CONNECT TO ONE {inputChar} ")
-
-        try:
-            server = int(server) - 1
-        except:
-            pass
-
-        await ServerUtilities.ServerCon.Connect(server)
+    await AskConnectToServer()
 
     memMode = 1
     memResponse = ServerUtilities.ExecuteCommand("get_memories", "", -1)
@@ -266,7 +273,7 @@ async def ClearMemories() -> None:
         PrintWithMode(memMode, f"Memory #{idx}: {memText}", Flush = True)
     
     print("")
-    mem = input(f"MEMORY INDEX TO DELETE {inputChar} ")
+    mem = input("MEMORY INDEX TO DELETE # ")
                 
     try:
         mem = int(mem)
@@ -285,7 +292,72 @@ async def ClearMemories() -> None:
         return
                 
     await ServerUtilities.DeleteMemory(mem)
-    Clear()
+    Clear(True)
+
+async def DownloadAndPrintConversation() -> None:
+    Clear(True)
+
+    await AskConnectToServer()
+    response = ServerUtilities.ExecuteCommand("get_conversation", "", -1)
+    fullJson = ""
+
+    async for res in response:
+        fullJson += res["response"]
+
+    fullJson = json.loads(fullJson)
+
+    if (len(fullJson) > 0):
+        print(" [ ## CONVERSATION RESTORED ## ] ")
+
+    for message in fullJson:
+        messageFiles = 0
+
+        for cont in message["content"]:
+            if (cont["type"] != "text"):
+                messageFiles += 1
+                continue
+
+            if (message["role"] == "user"):
+                for line in cont["text"].split("\n"):
+                    print(f"$ {cont['text']}", flush = True)
+            else:
+                mode = 0
+                subMode = 0
+
+                for line in cont["text"].split("\n"):
+                    if (line.count("```") > 0):
+                        if (mode == 0):
+                            print(line[:line.index("```")], end = "", flush = True)
+                            PrintWithMode(2, line[line.index("```"):], Flush = True)
+
+                            mode = 2
+                            continue
+                        elif (mode == 2):
+                            PrintWithMode(2, line[:line.index("```") + 3], End = "", Flush = True)
+                            print(line[line.index("```") + 3:], flush = True)
+
+                            mode = 0
+                            continue
+                    elif (line.count("<think>") > 0):
+                        print(line[:line.index("<think>")], end = "", flush = True)
+                        PrintWithMode(1, line[line.index("<think>"):], Flush = True)
+
+                        mode = 1
+                        continue
+                    elif (line.count("</think>") > 0):
+                        PrintWithMode(1, line[:line.index("</think>") + 8], End = "", Flush = True)
+                        print(line[line.index("</think>") + 8:], flush = True)
+
+                        mode = 0
+                        continue
+
+                    PrintWithMode(mode, line, Flush = True)
+
+async def AskConnectToServer() -> None:
+    if (ServerUtilities.ServerCon.IsConnected()):
+        return
+
+    await ServerUtilities.ServerCon.Connect(0)
 
 if (os.path.exists("config.json")):
     with open("config.json", "r") as f:
@@ -301,28 +373,29 @@ else:
         "index": -1,
         "think_mode_bg": Back.RESET,
         "think_mode_fg": Fore.MAGENTA,
-        "code_mode_bg": Back.BLACK,
+        "code_mode_bg": Back.RESET,
         "code_mode_fg": Fore.YELLOW,
         "normal_bg": Back.RESET,
         "normal_fg": Fore.RESET,
         "error_bg": Back.RESET,
         "error_fg": Fore.RED,
-        "service": Service.ToString(Service.Chatbot)
+        "service": ServiceManager.ToString(Service.Chatbot),
+        "show_think": False
     }
 
 loop = asyncio.new_event_loop()
 lastErrorInfo = ""
 
 Clear(True)
+loop.run_until_complete(DownloadAndPrintConversation())
 
 while (True):
     try:
         files = []
         prompt = ""
-        inputChar = "$"
 
         while (True):
-            tempPrompt = input(f"{inputChar} ")
+            tempPrompt = input("$ ")
 
             if (tempPrompt.lower().strip().endswith("/conf")):
                 EditConfig()
@@ -343,7 +416,7 @@ while (True):
             elif (tempPrompt.lower().strip().endswith("/idx")):
                 Clear()
 
-                index = input(f"INDEX {inputChar} ")
+                index = input("INDEX # ")
                 extraConfig["index"] = int(index)
 
                 Clear(True)
@@ -352,7 +425,7 @@ while (True):
                 Clear()
 
                 while (True):
-                    filePath = input(f"FILE #{len(files) + 1} PATH {inputChar} ").strip()
+                    filePath = input(f"FILE #{len(files) + 1} PATH $ ").strip()
 
                     if (len(filePath) == 0):
                         break
@@ -381,7 +454,7 @@ while (True):
                         fileType = "video"
                     else:
                         print("UNKNOWN FILE TYPE. SPECIFY THE FILE TYPE")
-                        fileType = input(f"(image, audio or video) {inputChar} ").lower().strip()
+                        fileType = input("(image, audio or video) $ ").lower().strip()
 
                         if (fileType != "image" and fileType != "audio" and fileType != "video"):
                             print("INVALID FILE TYPE. FILE NOT SAVED")
@@ -392,7 +465,7 @@ while (True):
                 Clear(True)
                 continue
             elif (tempPrompt.lower().strip().endswith("/chserv") or tempPrompt.lower().strip().endswith("/chs")):
-                extraConfig["service"] = ServiceManager.ToString(ServiceManager.FromString(input(f"SERVICE TO CHANGE {inputChar} ").lower().strip()))
+                extraConfig["service"] = ServiceManager.ToString(ServiceManager.FromString(input("SERVICE TO CHANGE $ ").lower().strip()))
                 continue
             elif (tempPrompt.lower().strip().endswith("/clear") or tempPrompt.lower().strip().endswith("/cls")):
                 Clear(True)
@@ -404,25 +477,16 @@ while (True):
                 if (confirm):
                     continue
 
-                if (not ServerUtilities.ServerCon.IsConnected()):
-                    for idx, server in enumerate(ServerUtilities.Conf.Servers):
-                        print(f"Server #{idx + 1}: {server}")
-
-                    server = input(f"YOU'RE NOT CONNECTED TO ANY SERVER. PLEASE CONNECT TO ONE {inputChar} ")
-
-                    try:
-                        server = int(server) - 1
-                    except:
-                        pass
-
-                    loop.run_until_complete(ServerUtilities.ServerCon.Connect(server))
-
+                loop.run_until_complete(AskConnectToServer())
                 loop.run_until_complete(ServerUtilities.DeleteConversation(None))
-                Clear(True)
 
+                Clear(True)
                 continue
             elif (tempPrompt.lower().strip().endswith("/cm") or tempPrompt.lower().strip().endswith("/cms")):
                 loop.run_until_complete(ClearMemories())
+                continue
+            elif (tempPrompt.lower().strip().endswith("/tg_think")):
+                extraConfig["show_think"] = not extraConfig["show_think"]
                 continue
             elif (tempPrompt.lower().strip().endswith("/lasterr")):
                 Clear(True)
@@ -450,10 +514,10 @@ while (True):
                 print(" - Close the program WITHOUT SAVING.")
 
                 PrintWithMode(2, "/idx", End = "")
-                print(" - Select an index.")
+                print(f" - Select an index. [CURRENT: {extraConfig['index']}]")
 
                 PrintWithMode(2, "/files", End = "")
-                print(" - Append files to the message.")
+                print(f" - Append files to the message. [{len(files)} FILES ATTACHED]")
 
                 PrintWithMode(2, "/clear", End = "")
                 print(" or ", end = "")
@@ -476,9 +540,14 @@ while (True):
                 PrintWithMode(2, "/chs", End = "")
                 print(f" - Change the service. [CURRENT SERVICE: {extraConfig['service']}]")
 
+                PrintWithMode(2, "/tg_think", End = "")
+                print(f" - Toggle thinking. [CURRENT: {extraConfig['show_think']}]")
+
                 PrintWithMode(2, "/end", End = "")
                 print(" - Send the prompt to I4.0 and wait for an answer.")
 
+                continue
+            elif (len(tempPrompt.strip()) == 0):
                 continue
 
             prompt += f"{tempPrompt}\n"
@@ -487,14 +556,18 @@ while (True):
                 prompt = prompt[:prompt.lower().rfind("/end")].strip()
 
                 break
-
-            inputChar = ">"
         
         if (prompt.endswith("/bye")):
             break
 
         loop.run_until_complete(SendPromptToServer(ServiceManager.FromString(extraConfig["service"]), prompt, files, extraConfig["index"]))
+        loop.run_until_complete(ServerUtilities.ServerCon.Disconnect())
     except KeyboardInterrupt:
+        try:
+            loop.run_until_complete(ServerUtilities.ServerCon.Disconnect())
+        except:
+            pass
+
         PrintWithMode(3, "\nTO CLOSE THE PROGRAM, PLEASE TYPE ", End = "")
         PrintWithMode(2, "/bye")
     except Exception as ex:
@@ -505,6 +578,7 @@ while (True):
         PrintWithMode(3, " FOR MORE DETAILS.")
 
         lastErrorInfo = "\n".join(traceback.format_exception(ex))
+        loop.run_until_complete(ServerUtilities.ServerCon.Disconnect())
 
 loop.run_until_complete(ServerUtilities.ServerCon.Disconnect())
 loop.close()
